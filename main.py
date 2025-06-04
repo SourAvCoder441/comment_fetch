@@ -29,12 +29,13 @@ CONFIG = {
     'retry_delay': 5,
     'data_file': os.path.join(os.getcwd(), 'facebook_comments_data.xlsx'),
     'state_file': os.path.join(os.getcwd(), 'last_comment_state.json'),
-    'fields': 'id,from{name},created_time,message'
+    'comment_fields': 'id,from{name},created_time,message',
+    'post_fields': 'message'
 }
 
 def load_last_state() -> Dict:
-    """Load the last processed comment ID and timestamp"""
-    default_state = {'last_comment_id': None, 'last_comment_time': None}
+    """Load the last processed comment ID, timestamp, and post description"""
+    default_state = {'last_comment_id': None, 'last_comment_time': None, 'post_description': None}
     if os.path.exists(CONFIG['state_file']):
         try:
             with open(CONFIG['state_file'], 'r') as f:
@@ -44,32 +45,67 @@ def load_last_state() -> Dict:
             logger.warning(f"Error loading state file: {e}. Using defaults.")
     return default_state
 
-def save_last_state(last_comment_id: str, last_comment_time: str) -> bool:
-    """Save the last processed comment ID and timestamp"""
+def save_last_state(last_comment_id: str, last_comment_time: str, post_description: str) -> bool:
+    """Save the last processed comment ID, timestamp, and post description"""
     try:
         with open(CONFIG['state_file'], 'w') as f:
-            json.dump({'last_comment_id': last_comment_id, 'last_comment_time': last_comment_time}, f)
-        logger.info(f"Saved state with last comment ID: {last_comment_id}, time: {last_comment_time}")
+            json.dump({
+                'last_comment_id': last_comment_id,
+                'last_comment_time': last_comment_time,
+                'post_description': post_description
+            }, f)
+        logger.info(f"Saved state with last comment ID: {last_comment_id}, time: {last_comment_time}, post description: {post_description[:50] + '...' if post_description else 'None'}")
         return True
     except IOError as e:
         logger.error(f"Error saving state: {e}")
         return False
 
+def fetch_post_description() -> Optional[str]:
+    """Fetch the post description from the Facebook API"""
+    url = f'https://graph.facebook.com/{CONFIG["api_version"]}/{CONFIG["page_id"]}_{CONFIG["post_id"]}'
+    params = {
+        'fields': CONFIG['post_fields'],
+        'access_token': CONFIG['access_token']
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        description = data.get('message', '')
+        if description:
+            logger.info(f"Successfully fetched post description: {description[:50] + '...' if len(description) > 50 else description}")
+        else:
+            logger.warning("Post description is empty or missing")
+        return description if description else None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch post description: {e}")
+        return None
+
 def fetch_comments(last_comment_time: Optional[str] = None) -> List[Dict]:
     """Fetch comments from Facebook API with pagination, using timestamp for new comments"""
     base_url = f'https://graph.facebook.com/{CONFIG["api_version"]}/{CONFIG["page_id"]}_{CONFIG["post_id"]}/comments'
     params = {
-        'fields': CONFIG['fields'],
+        'fields': CONFIG['comment_fields'],
         'access_token': CONFIG['access_token'],
         'limit': 100,
         'order': 'chronological'
     }
     if last_comment_time:
         try:
+            # Try parsing with ISO format (with timezone)
             dt = datetime.strptime(last_comment_time, '%Y-%m-%dT%H:%M:%S%z')
             params['since'] = int(dt.timestamp())
-        except ValueError as e:
-            logger.warning(f"Invalid last_comment_time format: {e}. Fetching all comments.")
+        except ValueError:
+            try:
+                # Fallback to non-timezone format
+                dt = datetime.strptime(last_comment_time, '%Y-%m-%d %H:%M:%S')
+                # Assume UTC for consistency
+                dt = dt.replace(tzinfo=timezone.utc)
+                params['since'] = int(dt.timestamp())
+                logger.info(f"Parsed last_comment_time as non-timezone format: {last_comment_time}")
+            except ValueError as e:
+                logger.warning(f"Invalid last_comment_time format: {e}. Fetching all comments.")
+                params.pop('since', None)
 
     all_comments = []
     url = base_url
@@ -106,19 +142,27 @@ def fetch_comments(last_comment_time: Optional[str] = None) -> List[Dict]:
     logger.info(f"Fetched {len(all_comments)} new comments")
     return all_comments
 
-def process_comments(comments: List[Dict]) -> List[Dict]:
-    """Process comments into a structured format"""
+def process_comments(comments: List[Dict], post_description: str) -> List[Dict]:
+    """Process comments into a structured format, including post description"""
     processed = []
     for comment in comments:
         try:
             comment_id = str(comment.get('id', '')).strip()
             if not comment_id:
                 continue
+            created_time = comment.get('created_time', '')
+            # Ensure created_time is in ISO format with timezone for consistency
+            try:
+                dt = datetime.strptime(created_time, '%Y-%m-%dT%H:%M:%S%z')
+                formatted_time = dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+            except ValueError:
+                formatted_time = created_time  # Fallback to raw value if parsing fails
             processed.append({
                 'id': comment_id,
                 'name': comment.get('from', {}).get('name', 'Unknown'),
-                'time': comment.get('created_time', ''),
-                'message': comment.get('message', '[No text]')
+                'time': formatted_time,
+                'message': comment.get('message', '[No text]'),
+                'post_description': post_description or '[No description]'
             })
         except Exception as e:
             logger.error(f"Error processing comment {comment.get('id', 'unknown')}: {e}")
@@ -141,7 +185,7 @@ def save_to_excel(new_comments: List[Dict]) -> Optional[tuple]:
             # Filter out duplicates based on comment ID
             df_new = df_new[~df_new['id'].astype(str).isin(existing_ids)]
         else:
-            df_existing = pd.DataFrame(columns=['id', 'name', 'time', 'message'])
+            df_existing = pd.DataFrame(columns=['id', 'name', 'time', 'message', 'post_description'])
 
         if not df_new.empty:
             # Append new comments to existing ones
@@ -184,6 +228,13 @@ def main():
         return
 
     state = load_last_state()
+    post_description = state.get('post_description')
+
+    # Fetch post description if not already stored
+    if not post_description:
+        post_description = fetch_post_description()
+        if post_description is None:
+            logger.warning("Continuing without post description due to fetch failure")
 
     while True:
         logger.info(f"Checking for new comments at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
@@ -191,14 +242,16 @@ def main():
         # Fetch comments since last processed comment time
         comments = fetch_comments(state.get('last_comment_time'))
         if comments:
-            processed = process_comments(comments)
+            processed = process_comments(comments, post_description)
             if processed:
                 last_info = save_to_excel(processed)
                 if last_info:
                     last_comment_id, last_comment_time = last_info
-                    save_last_state(last_comment_id, last_comment_time)
+                    # Only save post_description if it exists
+                    save_last_state(last_comment_id, last_comment_time, post_description if post_description else state.get('post_description'))
                     state['last_comment_id'] = last_comment_id
                     state['last_comment_time'] = last_comment_time
+                    state['post_description'] = post_description if post_description else state.get('post_description')
                     logger.info(f"Updated state with new last comment ID: {last_comment_id}, time: {last_comment_time}")
             else:
                 logger.info("No comments processed")
